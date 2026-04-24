@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv/
+wandb/
+*.npz
+*.pkl
+*.pdb
+checkpoints/
+*.log
+*.txt
+!requirements.txt
