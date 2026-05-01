@@ -3,7 +3,6 @@ ProteinChameleon causal language model.
 
 Extends Gemma4ForCausalLM with:
   - Expanded embedding + LM-head covering both text and protein structure tokens
-  - Optional QK normalisation on every attention layer (Chameleon-style)
   - `from_gemma` factory that loads a pretrained Gemma4 checkpoint and wires
     in the protein token vocabulary in one call
 
@@ -13,6 +12,9 @@ Architecture (early fusion):
   - Sequences look like:
         [text tokens]  <PROT_START>  [protein struct tokens]  <PROT_END>  [text tokens]
   - Next-token prediction over the unified vocabulary (text ∪ protein tokens)
+
+Note: Gemma4 already applies q_norm/k_norm/v_norm inside every attention layer,
+so no additional QK normalisation wrapper is needed.
 """
 
 from __future__ import annotations
@@ -20,55 +22,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from transformers import Gemma4ForCausalLM
+from transformers.models.gemma4.modeling_gemma4 import Gemma4TextScaledWordEmbedding
 
 from .config import ProteinChameleonConfig
 from .tokenizer import ProteinChameleonTokenizer
-
-
-# ── QK normalisation (Chameleon §3.2) ────────────────────────────────────────
-
-class QKNormAttention(nn.Module):
-    """
-    Wraps any attention layer and applies RMSNorm to Q and K before the
-    scaled dot-product. Works with any HuggingFace attention module that
-    exposes q_proj and k_proj as submodules.
-    """
-
-    def __init__(self, base_attn: nn.Module, hidden_size: int, num_heads: int) -> None:
-        super().__init__()
-        self.base_attn = base_attn
-        head_dim = hidden_size // num_heads
-        self.q_norm = nn.RMSNorm(head_dim)
-        self.k_norm = nn.RMSNorm(head_dim)
-
-    def forward(self, hidden_states, **kwargs):
-        orig_q = self.base_attn.q_proj
-        orig_k = self.base_attn.k_proj
-        q_norm  = self.q_norm
-        k_norm  = self.k_norm
-
-        class _NormedQ(nn.Module):
-            def forward(self_, x):
-                out = orig_q(x)
-                B, T, _ = out.shape
-                h = out.view(B, T, -1, q_norm.normalized_shape[0])
-                h = q_norm(h)
-                return h.view(B, T, -1)
-
-        class _NormedK(nn.Module):
-            def forward(self_, x):
-                out = orig_k(x)
-                B, T, _ = out.shape
-                h = out.view(B, T, -1, k_norm.normalized_shape[0])
-                h = k_norm(h)
-                return h.view(B, T, -1)
-
-        self.base_attn.q_proj = _NormedQ()
-        self.base_attn.k_proj = _NormedK()
-        result = self.base_attn(hidden_states, **kwargs)
-        self.base_attn.q_proj = orig_q
-        self.base_attn.k_proj = orig_k
-        return result
 
 
 # ── Main model ────────────────────────────────────────────────────────────────
@@ -78,8 +35,7 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
     Gemma4ForCausalLM with an expanded vocabulary for protein structure tokens.
 
     Changes vs vanilla Gemma4:
-      1. embed_tokens and lm_head cover total_vocab_size tokens.
-      2. Optional QK normalisation on every attention layer.
+      1. embed_tokens, embed_tokens_per_layer, and lm_head cover total_vocab_size tokens.
     """
 
     config_class = ProteinChameleonConfig
@@ -93,18 +49,7 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
         self.model.embed_tokens = nn.Embedding(total_vocab, hidden_size)
         self.lm_head = nn.Linear(hidden_size, total_vocab, bias=False)
 
-        if config.use_qk_norm:
-            self._apply_qk_norm()
-
         self.post_init()
-
-    def _apply_qk_norm(self) -> None:
-        for layer in self.model.layers:
-            layer.self_attn = QKNormAttention(
-                layer.self_attn,
-                hidden_size=self.config.hidden_size,
-                num_heads=self.config.num_attention_heads,
-            )
 
     @classmethod
     def from_gemma(
@@ -121,9 +66,8 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
         Steps:
           1. Load Gemma4ForCausalLM on CPU to extract weights.
           2. Reload with quantization/device_map kwargs applied.
-          3. Swap embed_tokens and lm_head with expanded versions.
+          3. Swap embed_tokens, embed_tokens_per_layer, and lm_head with expanded versions.
           4. Copy pretrained text weights; init protein rows with small noise.
-          5. Apply QK norm if requested.
         """
         # ── 1. Load on CPU to get weights and config ──────────────────────────
         base_cpu = Gemma4ForCausalLM.from_pretrained(
@@ -159,12 +103,14 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
         hidden_size = config.hidden_size
 
         # ── 4. Swap embed_tokens + lm_head with expanded unquantized versions ─
-        # Create on CPU — GPUs are already full with the 4-bit model weights
+        # Create on CPU — GPUs are already full with the model weights
         new_embed   = nn.Embedding(total_vocab, hidden_size).to("cpu").to(torch_dtype)
         new_lm_head = nn.Linear(hidden_size, total_vocab, bias=False).to("cpu").to(torch_dtype)
 
         # Gemma ties lm_head.weight to embed_tokens.weight — use whichever exists
-        embed_w = base_state.get("model.embed_tokens.weight") or base_state.get("lm_head.weight")
+        embed_w = base_state.get("model.embed_tokens.weight")
+        if embed_w is None:
+            embed_w = base_state.get("lm_head.weight")
 
         std = 0.02
         with torch.no_grad():
@@ -177,14 +123,21 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
         base.lm_head            = new_lm_head
         base.config             = config
 
-        # ── 5. Apply QK norm ──────────────────────────────────────────────────
-        if use_qk_norm:
-            for layer in base.model.layers:
-                layer.self_attn = QKNormAttention(
-                    layer.self_attn,
-                    hidden_size=config.hidden_size,
-                    num_heads=config.num_attention_heads,
-                )
+        # ── 4b. Expand embed_tokens_per_layer (Gemma4-specific per-layer input embedding) ─
+        per_layer_emb = getattr(base.model, "embed_tokens_per_layer", None)
+        per_layer_w   = base_state.get("model.embed_tokens_per_layer.weight")
+        if per_layer_emb is not None and per_layer_w is not None:
+            per_layer_dim = per_layer_w.shape[1]
+            embed_scale   = per_layer_emb.scalar_embed_scale
+            new_per_layer = Gemma4TextScaledWordEmbedding(
+                total_vocab, per_layer_dim,
+                padding_idx=per_layer_emb.padding_idx,
+                embed_scale=embed_scale,
+            ).to("cpu").to(torch_dtype)
+            with torch.no_grad():
+                new_per_layer.weight[:orig_vocab] = per_layer_w.cpu()
+                nn.init.normal_(new_per_layer.weight[orig_vocab:], std=std)
+            base.model.embed_tokens_per_layer = new_per_layer
 
         base.__class__ = cls
         return base
