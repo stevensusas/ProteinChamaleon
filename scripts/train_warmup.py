@@ -1,16 +1,19 @@
 """
-Stage 1 — Protein token warmup training (QLoRA).
+Stage 1 — Protein token warmup training.
 
 Trains ProteinChameleonForCausalLM on protein-only token sequences using
-next-token prediction. Uses 4-bit QLoRA so Mistral-7B fits on a single GPU.
+next-token prediction. Designed for A100 (40GB) — runs Gemma4 E4B in BF16
+with LoRA, no quantization needed.
 
-Input:  /data/steven/ProteinChamaleon/encoded/warmup.npz
-Output: /data/steven/ProteinChamaleon/checkpoints/warmup/
+Input:  warmup.npz (pre-encoded PT-BPE token arrays)
+Output: checkpoints/warmup/
 
 Usage:
-    python scripts/train_warmup.py
-    python scripts/train_warmup.py --base-model /path/to/mistral \
-        --max-length 1024 --batch-size 2 --grad-accum 16 --steps 1000
+    python scripts/train_warmup.py --base-model google/gemma-4-E4B
+    python scripts/train_warmup.py --base-model google/gemma-4-E4B \
+        --encoded-file /path/to/warmup.npz \
+        --out-dir /path/to/checkpoints/warmup \
+        --max-length 1024 --batch-size 4 --grad-accum 8 --steps 1000
 """
 
 import argparse
@@ -22,13 +25,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Subset
-from transformers import (
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling,
-    BitsAndBytesConfig,
-)
-from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from peft import LoraConfig, get_peft_model, TaskType
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from model import ProteinChameleonTokenizer, ProteinChameleonForCausalLM
@@ -39,9 +37,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("warmup")
-
-ENCODED_FILE = Path("/data/steven/ProteinChamaleon/encoded/warmup.npz")
-OUT_DIR      = Path("/data/steven/ProteinChamaleon/checkpoints/warmup")
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -66,11 +61,12 @@ class WarmupDataset(Dataset):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    logger.info("Loading encoded proteins from %s", ENCODED_FILE)
-    data = np.load(ENCODED_FILE, allow_pickle=True)
+    logger.info("Loading encoded proteins from %s", args.encoded_file)
+    data = np.load(args.encoded_file, allow_pickle=True)
     token_ids = data["token_ids"]
     logger.info("Loaded %d proteins", len(token_ids))
 
@@ -83,25 +79,15 @@ def main(args):
     val_dataset   = Subset(WarmupDataset(token_ids, tokenizer, args.max_length), indices[:n_val])
     logger.info("Train: %d  Val: %d", len(train_dataset), len(val_dataset))
 
-    # ── Model (QLoRA) ─────────────────────────────────────────────────────────
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-
-    logger.info("Loading base model %s with 4-bit quantization", args.base_model)
-    model = ProteinChameleonForCausalLM.from_llama(
+    # ── Model ─────────────────────────────────────────────────────────────────
+    logger.info("Loading %s", args.base_model)
+    model = ProteinChameleonForCausalLM.from_gemma(
         args.base_model,
         tokenizer=tokenizer,
         use_qk_norm=True,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        quantization_config=bnb_config,
     )
-
-    model = prepare_model_for_kbit_training(model)
 
     lora_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -113,7 +99,7 @@ def main(args):
     )
     model = get_peft_model(model, lora_cfg)
 
-    # Protein token rows are random init — always train them fully
+    # Protein token rows are randomly initialised — always train them fully
     for name, param in model.named_parameters():
         if "embed_tokens" in name or "lm_head" in name:
             param.requires_grad_(True)
@@ -126,7 +112,7 @@ def main(args):
     collator = DataCollatorForLanguageModeling(tokenizer=text_tok, mlm=False)
 
     training_args = TrainingArguments(
-        output_dir=str(OUT_DIR),
+        output_dir=str(out_dir),
         max_steps=args.steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -157,16 +143,18 @@ def main(args):
 
     logger.info("Starting warmup training for %d steps", args.steps)
     trainer.train()
-    trainer.save_model(str(OUT_DIR / "final"))
-    logger.info("Done. Saved to %s", OUT_DIR / "final")
+    trainer.save_model(str(out_dir / "final"))
+    logger.info("Done. Saved to %s", out_dir / "final")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-model", default="mistralai/Mistral-7B-v0.1")
-    parser.add_argument("--max-length", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=16)
-    parser.add_argument("--steps",      type=int, default=1000)
+    parser.add_argument("--base-model",    default="google/gemma-4-E4B")
+    parser.add_argument("--encoded-file",  default="encoded/warmup.npz")
+    parser.add_argument("--out-dir",       default="checkpoints/warmup")
+    parser.add_argument("--max-length",    type=int, default=1024)
+    parser.add_argument("--batch-size",    type=int, default=4)
+    parser.add_argument("--grad-accum",    type=int, default=8)
+    parser.add_argument("--steps",         type=int, default=1000)
     args = parser.parse_args()
     main(args)
