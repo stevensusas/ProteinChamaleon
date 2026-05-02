@@ -51,6 +51,20 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
 
         self.post_init()
 
+    def tie_weights(self):
+        # Gemma ties lm_head ↔ embed_tokens for text rows only.
+        # Protein token rows are intentionally untied — super().tie_weights() would
+        # overwrite the learned lm_head protein rows with embed_tokens values.
+        offset = self.config.protein_token_offset
+        if offset == 0:
+            super().tie_weights()
+            return
+        with torch.no_grad():
+            saved = self.lm_head.weight[offset:].clone()
+        super().tie_weights()
+        with torch.no_grad():
+            self.lm_head.weight[offset:] = saved
+
     @classmethod
     def from_gemma(
         cls,
@@ -112,16 +126,16 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
         if embed_w is None:
             embed_w = base_state.get("lm_head.weight")
 
-        std = 0.02
         with torch.no_grad():
-            new_embed.weight[:orig_vocab]   = embed_w.cpu()
-            new_lm_head.weight[:orig_vocab] = embed_w.cpu()
-            nn.init.normal_(new_embed.weight[orig_vocab:],   std=std)
-            nn.init.normal_(new_lm_head.weight[orig_vocab:], std=std)
+            new_embed.weight[:orig_vocab]    = embed_w.cpu()
+            nn.init.normal_(new_embed.weight[orig_vocab:], std=0.002)
+            new_lm_head.weight[:orig_vocab]  = embed_w.cpu()
+            new_lm_head.weight[orig_vocab:].zero_()   # zero-init: protein logits start at 0
 
         base.model.embed_tokens = new_embed
         base.lm_head            = new_lm_head
         base.config             = config
+        base.vocab_size         = config.vocab_size
 
         # ── 4b. Expand embed_tokens_per_layer (Gemma4-specific per-layer input embedding) ─
         per_layer_emb = getattr(base.model, "embed_tokens_per_layer", None)
@@ -136,7 +150,7 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
             ).to("cpu").to(torch_dtype)
             with torch.no_grad():
                 new_per_layer.weight[:orig_vocab] = per_layer_w.cpu()
-                nn.init.normal_(new_per_layer.weight[orig_vocab:], std=std)
+                new_per_layer.weight[orig_vocab:].zero_()  # zero-init: prevents scale amplification across 42 layers
             base.model.embed_tokens_per_layer = new_per_layer
 
         base.__class__ = cls

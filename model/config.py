@@ -40,6 +40,14 @@ class ProteinChameleonConfig(Gemma4Config):
         self.max_protein_tokens   = max_protein_tokens
         self.protein_token_offset = protein_token_offset
         self.use_qk_norm          = use_qk_norm
+        # Gemma4Config nests vocab_size under text_config rather than exposing it
+        # directly. PEFT needs config.vocab_size to detect embedding resizing, so
+        # derive it here if not already set (e.g. by apply_to_config).
+        if not hasattr(self, "vocab_size"):
+            try:
+                self.vocab_size = self.text_config.vocab_size
+            except AttributeError:
+                pass
 
     def protein_token_id(self, local_id: int) -> int:
         return self.protein_token_offset + local_id
