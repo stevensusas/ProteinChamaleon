@@ -39,6 +39,7 @@ sys.path.insert(0, "/home/steven/GeoBPE")
 from foldingdiff.angles_and_coords import create_new_chain_nerf
 
 STRUCT_COLOR = "#4C72B0"
+GT_COLOR     = "#DD8452"
 
 
 # ── BPE decode ────────────────────────────────────────────────────────────────
@@ -384,37 +385,57 @@ def build_interleaved_html(ex, bpe, metrics=None, scorers=None):
             pass
 
     print(f"  [{accession}] GT segments...")
-    gt_parts, _           = render_segments_html(gt_segs,  "gt",  bpe, collect_angles=False)
+    gt_parts, gt_angles   = render_segments_html(gt_segs,  "gt",  bpe, collect_angles=True)
     print(f"  [{accession}] Gen segments...")
     gen_parts, gen_angles = render_segments_html(gen_segs, "gen", bpe, collect_angles=True)
 
-    # Ramachandran
+    # Ramachandran — compare GT vs generated
     rama_html = ""
-    valid_angles = [a for a in gen_angles if a is not None]
-    rama_scores = []
-    for adf in valid_angles:
-        s = ramachandran_score(adf)
-        if s is not None:
-            rama_scores.append(s)
 
-    if valid_angles:
-        all_phi, all_psi = [], []
-        for adf in valid_angles:
-            if adf is not None and "phi" in adf:
-                all_phi.extend(adf["phi"].tolist())
-                all_psi.extend(adf["psi"].tolist())
-        # build a combined angles_df for the plot
-        combined = pd.DataFrame({"phi": all_phi, "psi": all_psi})
-        rama_b64 = ramachandran_png_b64([combined], ["Generated structures"], [STRUCT_COLOR])
-        avg_rama = np.mean(rama_scores) if rama_scores else None
-        if avg_rama is not None and metrics is not None:
-            metrics["ramachandran_allowed"] = avg_rama
+    def collect_phi_psi(angles_list):
+        phi_all, psi_all = [], []
+        scores = []
+        for adf in angles_list:
+            if adf is None:
+                continue
+            s = ramachandran_score(adf)
+            if s is not None:
+                scores.append(s)
+            if "phi" in adf:
+                phi_all.extend(np.array(adf["phi"], dtype=float).tolist())
+                psi_all.extend(np.array(adf["psi"], dtype=float).tolist())
+        return phi_all, psi_all, scores
+
+    gt_phi,  gt_psi,  gt_scores  = collect_phi_psi([a for a in gt_angles  if a is not None])
+    gen_phi, gen_psi, gen_scores = collect_phi_psi([a for a in gen_angles if a is not None])
+
+    avg_gt_rama  = float(np.mean(gt_scores))  if gt_scores  else None
+    avg_gen_rama = float(np.mean(gen_scores)) if gen_scores else None
+
+    if metrics is not None:
+        if avg_gt_rama  is not None: metrics["ramachandran_allowed_gt"]  = avg_gt_rama
+        if avg_gen_rama is not None: metrics["ramachandran_allowed_gen"] = avg_gen_rama
+
+    if gt_phi or gen_phi:
+        angle_sets, labels, colors = [], [], []
+        if gt_phi:
+            angle_sets.append(pd.DataFrame({"phi": gt_phi,  "psi": gt_psi}))
+            labels.append("Ground truth")
+            colors.append(GT_COLOR)
+        if gen_phi:
+            angle_sets.append(pd.DataFrame({"phi": gen_phi, "psi": gen_psi}))
+            labels.append("Generated")
+            colors.append(STRUCT_COLOR)
+        rama_b64 = ramachandran_png_b64(angle_sets, labels, colors)
+        caption_parts = []
+        if avg_gt_rama  is not None: caption_parts.append(f"GT: {avg_gt_rama*100:.1f}%")
+        if avg_gen_rama is not None: caption_parts.append(f"Gen: {avg_gen_rama*100:.1f}%")
+        caption = "Ramachandran — % in allowed regions: " + ", ".join(caption_parts) if caption_parts else "Ramachandran plot"
         rama_html = (
             f"<div class='rama-figure'>"
             f"<img src='data:image/png;base64,{rama_b64}'/>"
-            f"<div class='struct-caption'>Ramachandran plot of generated structures"
-            + (f" &mdash; {avg_rama*100:.1f}% in allowed regions" if avg_rama is not None else "")
-            + f"</div></div>"
+            f"<div class='struct-caption'>{caption}</div>"
+            f"</div>"
         )
 
     seq_display = he(ex.get("sequence", ""))
