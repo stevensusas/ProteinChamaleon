@@ -106,6 +106,11 @@ def build_decoy_index(accessions, token_ids, proteins_csv, features_csv, seed=42
     ec_list = [ec[accessions[i]] for i in range(n)]
     sf_list = [superfam[accessions[i]] for i in range(n)]
 
+    # Cap how many candidates we examine per protein: pools for common superfamilies
+    # / ECs can hold hundreds of members, making the filter quadratic. Sampling a
+    # bounded subset keeps it fast; we still pick the length-closest that passes.
+    POOL_CAP = 400
+
     def closest_len(i, candidates):
         cand = [c for c in candidates if c != i]
         if not cand:
@@ -114,21 +119,29 @@ def build_decoy_index(accessions, token_ids, proteins_csv, features_csv, seed=42
         j = cand[np.argmin(np.abs(lengths[cand] - lengths[i]))]
         return int(j)
 
+    def capped(pool):
+        pool = list(pool)
+        if len(pool) > POOL_CAP:
+            pool = rng.choice(pool, size=POOL_CAP, replace=False).tolist()
+        return pool
+
     idx = {c: np.full(n, -1, dtype=int) for c in CONDITIONS}
-    for i in range(n):
+    for i in tqdm(range(n), desc="building decoy index"):
         # same fold (shared superfamily), different function (disjoint EC, both have EC)
         if ec_list[i]:
             pool = set()
             for sf in sf_list[i]:
                 pool.update(sf_to_rows.get(sf, []))
-            cand = [c for c in pool if c != i and ec_list[c] and ec_list[c].isdisjoint(ec_list[i])]
+            cand = [c for c in capped(pool)
+                    if c != i and ec_list[c] and ec_list[c].isdisjoint(ec_list[i])]
             idx["same_fold_diff_fn"][i] = closest_len(i, cand)
 
             # same function (shared EC), different fold (disjoint superfamily)
             pool = set()
             for e in ec_list[i]:
                 pool.update(ec_to_rows.get(e, []))
-            cand = [c for c in pool if c != i and (not sf_list[c] or sf_list[c].isdisjoint(sf_list[i]))]
+            cand = [c for c in capped(pool)
+                    if c != i and (not sf_list[c] or sf_list[c].isdisjoint(sf_list[i]))]
             idx["same_fn_diff_fold"][i] = closest_len(i, cand)
 
         # length-matched random: nearest length among a random candidate subset
@@ -198,7 +211,8 @@ def main():
 
     d = np.load(args.align_test, allow_pickle=True)
     accessions    = [str(a) for a in d["accessions"]]
-    token_ids     = [d["token_ids"][i].tolist() for i in range(len(accessions))]
+    _tid          = d["token_ids"]  # load ONCE (NpzFile re-decompresses on every access)
+    token_ids     = [_tid[i].tolist() for i in range(len(accessions))]
     sequences     = d["sequences"]
     function_text = d["function_text"]
     organism      = d["organism"]
